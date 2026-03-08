@@ -487,6 +487,7 @@ let raf,duration=0;
 let laneEls=[],keyBtnEls=[],judgeEls=[];
 let feverMode=false,lastBeatTime=0;
 let missCount=0,missRecoveryTimer=null;
+let analyzedBeats=null; // 사전 분석된 onset 목록
 
 // ── 레인 크기 동적 계산 ──
 function getLaneMetrics(){
@@ -664,9 +665,15 @@ async function handleFile(file){
     audioBuffer=await ac.decodeAudioData(ab);
     duration=audioBuffer.duration;
     const m=Math.floor(duration/60),s=Math.floor(duration%60).toString().padStart(2,'0');
-    document.getElementById('track-meta').textContent=m+':'+s+' · '+(file.size/1048576).toFixed(1)+'MB';
-    const bpm=estimateBPM(audioBuffer);
-    const badge=document.getElementById('bpm-badge');badge.textContent='♩ '+bpm+' BPM';badge.classList.add('visible');
+
+    // 비트 분석 (파일 로드 시 미리 실행)
+    document.getElementById('track-meta').textContent='박자 분석 중... 🎵';
+    document.getElementById('upload-char').textContent='🔍';
+    await new Promise(r=>setTimeout(r,30)); // UI 업데이트 기다리기
+    analyzedBeats = await analyzeBeats(audioBuffer);
+
+    document.getElementById('track-meta').textContent=m+':'+s+' · '+(file.size/1048576).toFixed(1)+'MB · '+analyzedBeats.length+'노트';
+    const badge=document.getElementById('bpm-badge');badge.textContent='♩ '+analyzedBeats.bpm+' BPM';badge.classList.add('visible');
     drawMiniWave(audioBuffer);
     document.getElementById('song-ticker').textContent='♪ '+file.name.replace(/\.[^/.]+$/,'').slice(0,40)+' ♪';
     document.getElementById('start-btn').classList.add('visible');
@@ -674,7 +681,167 @@ async function handleFile(file){
   }catch(err){
     document.getElementById('track-meta').textContent='오류: 지원하지 않는 파일입니다';
     document.getElementById('upload-char').textContent='😢';
+    console.error(err);
   }
+}
+
+// ══════════════════════════════════════════
+// 비트/onset 분석 엔진
+// ══════════════════════════════════════════
+async function analyzeBeats(buf){
+  const sr = buf.sampleRate;
+  const ch = buf.getChannelData(0);
+
+  // 1) 오프라인 컨텍스트로 3개 대역 필터링
+  //    저음(킥): 20~200Hz / 중음(스네어): 200~2000Hz / 고음(하이햇): 2000~8000Hz
+  const BANDS = [
+    {lo:20,   hi:200,  label:'low'},
+    {lo:200,  hi:2000, label:'mid'},
+    {lo:2000, hi:8000, label:'high'},
+  ];
+
+  const bandSignals = await Promise.all(BANDS.map(band=>filterBand(buf, band.lo, band.hi)));
+
+  // 2) 각 대역에서 onset(소리가 튀는 순간) 감지
+  const HOP = Math.floor(sr * 0.01);   // 10ms 단위로 분석
+  const WIN = Math.floor(sr * 0.04);   // 40ms 윈도우
+
+  // 3) BPM 추정 (전체 에너지 기반 자기상관)
+  const bpm = estimateBPM(buf);
+  const beatInterval = 60 / bpm; // 초 단위 한 박자
+
+  // 4) 각 대역에서 onset 시간 목록 추출
+  const allOnsets = []; // {time, band, strength}
+
+  for(let b=0;b<bandSignals.length;b++){
+    const sig = bandSignals[b];
+    const energy = [];
+    for(let i=0;i<sig.length-WIN;i+=HOP){
+      let e=0; for(let j=0;j<WIN;j++) e+=sig[i+j]**2;
+      energy.push(e/WIN);
+    }
+
+    // 에너지 급상승(flux) 감지
+    const flux = energy.map((e,i)=>i===0?0:Math.max(0,e-energy[i-1]));
+
+    // 로컬 평균 대비 임계값 초과한 지점 = onset
+    const W2 = 20; // 앞뒤 200ms 평균
+    const threshold = 1.4 + b*0.3; // 고음대역일수록 더 엄격하게
+
+    let lastOnset = -1;
+    const minGap = Math.floor(0.08/0.01); // 최소 80ms 간격
+
+    for(let i=W2;i<flux.length-W2;i++){
+      const localAvg = flux.slice(i-W2,i+W2).reduce((a,x)=>a+x,0)/(W2*2);
+      if(flux[i] > localAvg * threshold && flux[i] > 0 && i-lastOnset>minGap){
+        const time = (i*HOP)/sr;
+        allOnsets.push({time, band:b, strength:flux[i]/(localAvg+1e-9)});
+        lastOnset = i;
+      }
+    }
+  }
+
+  // 5) BPM 그리드에 스냅 + density 필터링
+  const snapped = snapToGrid(allOnsets, bpm, difficulty);
+
+  // 6) 레인 배정: 저음→가운데레인, 중음→양쪽, 고음→외곽
+  const mapped = assignLanes(snapped, laneCount);
+
+  // BPM 정보 붙여서 반환
+  mapped.bpm = bpm;
+  return mapped;
+}
+
+// 오프라인 컨텍스트로 밴드패스 필터 적용
+async function filterBand(buf, loHz, hiHz){
+  const sr = buf.sampleRate;
+  const len = buf.length;
+  const offCtx = new OfflineAudioContext(1, len, sr);
+  const src = offCtx.createBufferSource();
+  src.buffer = buf;
+
+  const lp = offCtx.createBiquadFilter();
+  lp.type = 'lowpass'; lp.frequency.value = hiHz; lp.Q.value = 0.7;
+  const hp = offCtx.createBiquadFilter();
+  hp.type = 'highpass'; hp.frequency.value = loHz; hp.Q.value = 0.7;
+
+  src.connect(hp); hp.connect(lp); lp.connect(offCtx.destination);
+  src.start(0);
+  const rendered = await offCtx.startRendering();
+  return rendered.getChannelData(0);
+}
+
+// BPM 그리드에 onset 스냅 + difficulty별 density 필터
+function snapToGrid(onsets, bpm, diff){
+  const beatSec = 60/bpm;
+  // difficulty별 허용 subdivision (easy:1박, normal:2분, hard:4분, insane:8분)
+  const subdivs = {easy:1, normal:2, hard:4, insane:8}[diff] || 2;
+  const gridUnit = beatSec / subdivs; // 그리드 단위 (초)
+  const snapTol  = gridUnit * 0.38;   // 38% 이내면 스냅
+
+  // density 배수
+  const densityMult = {easy:0.45, normal:0.65, hard:0.82, insane:1.0}[diff] || 0.65;
+
+  // strength 기준 정렬 후 상위 onset만 선택
+  const sorted = [...onsets].sort((a,b)=>b.strength-a.strength);
+  const keep = Math.floor(sorted.length * densityMult);
+  const selected = new Set(sorted.slice(0,keep).map(o=>o));
+
+  const result = [];
+  const usedGrids = new Set();
+
+  for(const o of onsets){
+    if(!selected.has(o)) continue;
+    // 가장 가까운 그리드 포인트 계산
+    const gridIdx = Math.round(o.time / gridUnit);
+    const snappedTime = gridIdx * gridUnit;
+    if(Math.abs(o.time - snappedTime) > snapTol) continue; // 그리드와 너무 멀면 스킵
+
+    // 같은 그리드에 이미 노트 있으면 스킵 (중복 방지)
+    if(usedGrids.has(gridIdx)) continue;
+    usedGrids.add(gridIdx);
+
+    result.push({time: snappedTime, band: o.band, strength: o.strength});
+  }
+
+  return result.sort((a,b)=>a.time-b.time);
+}
+
+// 레인 배정 로직
+function assignLanes(onsets, numLanes){
+  // 레인을 저음/중음/고음 그룹으로 나눔
+  // 4K: [low:1,2] [mid:0,3] [high:0,3]
+  // 6K: [low:2,3] [mid:1,4] [high:0,5]
+  const laneGroups = numLanes === 4
+    ? [[1,2],[0,3],[0,3]]           // band0(low)→가운데, band1(mid)→양쪽, band2(high)→양쪽
+    : [[2,3],[1,4],[0,5]];          // band0(low)→가운데2개, band1(mid)→중간, band2(high)→외곽
+
+  const lastLaneTime = new Array(numLanes).fill(-999);
+  const MIN_SAME_LANE_GAP = 0.12; // 같은 레인 최소 120ms 간격
+
+  return onsets.map(o=>{
+    const group = laneGroups[o.band] || laneGroups[0];
+    // 그룹 내에서 마지막으로 사용된 시간이 가장 오래된 레인 선택
+    let bestLane = group[0];
+    let bestTime = Infinity;
+    for(const lane of group){
+      if(lastLaneTime[lane] < bestTime){
+        bestTime = lastLaneTime[lane];
+        bestLane = lane;
+      }
+    }
+    // 최소 간격 체크 - 너무 최근에 그 레인 썼으면 다른 레인
+    if(o.time - lastLaneTime[bestLane] < MIN_SAME_LANE_GAP){
+      // 전체 레인 중 가장 여유 있는 곳
+      for(let i=0;i<numLanes;i++){
+        if(o.time - lastLaneTime[i] >= MIN_SAME_LANE_GAP){
+          bestLane = i; break;
+        }
+      }
+    }
+    lastLaneTime[bestLane] = o.time;
+    return {...o, lane: bestLane};
+  });
 }
 
 function estimateBPM(buf){
@@ -694,7 +861,17 @@ function drawMiniWave(buf){
 }
 
 // ── 설정 UI ──
-document.querySelectorAll('.diff-btn').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.diff-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');difficulty=b.dataset.diff;}));
+document.querySelectorAll('.diff-btn').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('.diff-btn').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active'); difficulty=b.dataset.diff;
+  // 분석 완료된 경우 노트 수 미리 업데이트
+  if(analyzedBeats){
+    const preview = reassignForDifficulty(analyzedBeats, difficulty, laneCount);
+    document.getElementById('track-meta').textContent=
+      document.getElementById('track-meta').textContent.replace(/·\s*\d+노트/,'')
+      + ' · '+preview.length+'노트';
+  }
+}));
 document.getElementById('speed-slider').addEventListener('input',function(){speedMult=parseFloat(this.value);document.getElementById('speed-val').textContent=speedMult.toFixed(1)+'×';});
 document.querySelectorAll('.lanes-opt').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.lanes-opt').forEach(x=>x.classList.remove('active'));b.classList.add('active');laneCount=parseInt(b.dataset.n);document.getElementById('key-hint-lbl').textContent=laneCount===4?'// 4K: D F J K //':'// 6K: S D F J K L //';buildLanes();}));
 
@@ -736,20 +913,57 @@ function startGame(){
 
 // ── 노트 스케줄 ──
 function scheduleNotes(){
-  const cfg=DIFF[difficulty],sp=cfg.speed*speedMult;
-  const {hitLineBottom}=getLaneMetrics(),H=lH();
-  const travelDist=H-hitLineBottom;
-  const beats=Math.floor(duration*1000/cfg.interval);
-  const lastAt=new Array(laneCount).fill(-999);
-  for(let i=0;i<beats;i++){
-    if(Math.random()>cfg.density)continue;
-    const lane=Math.floor(Math.random()*laneCount);
-    if(i-lastAt[lane]<2)continue;lastAt[lane]=i;
-    const spawnTime=(i*cfg.interval/1000)-(travelDist/sp);
-    if(spawnTime<0)continue;
-    notes.push({id:noteId++,lane,spawnTime,hit:false,el:null});totalNotes++;
+  const sp = DIFF[difficulty].speed * speedMult;
+  const {hitLineBottom} = getLaneMetrics();
+  const H = lH();
+  const travelDist = H - hitLineBottom;
+  const travelTime = travelDist / sp; // 화면 꼭대기→히트라인까지 걸리는 시간(초)
+
+  // analyzedBeats에 difficulty/laneCount 맞게 재배정 후 노트 등록
+  const beats = analyzedBeats
+    ? reassignForDifficulty(analyzedBeats, difficulty, laneCount)
+    : [];
+
+  for(const b of beats){
+    const hitTime = b.time;          // 히트라인에 도달해야 하는 음악 시간
+    const spawnTime = hitTime - travelTime; // 화면 위에 등장해야 하는 시간
+    notes.push({id:noteId++, lane:b.lane, spawnTime, hitTime, hit:false, el:null});
+    totalNotes++;
   }
 }
+
+// difficulty/laneCount 변경 시 레인만 재배정 (onset 시간은 고정)
+function reassignForDifficulty(beats, diff, numLanes){
+  // density 필터
+  const densityMult = {easy:0.4, normal:0.62, hard:0.82, insane:1.0}[diff] || 0.62;
+  const byStrength = [...beats].sort((a,b)=>b.strength-a.strength);
+  const keepCount  = Math.floor(byStrength.length * densityMult);
+  const kept = new Set(byStrength.slice(0, keepCount));
+
+  // 레인 그룹 재배정
+  const laneGroups = numLanes === 4
+    ? [[1,2],[0,3],[0,3]]
+    : [[2,3],[1,4],[0,5]];
+  const lastLaneTime = new Array(numLanes).fill(-999);
+  const MIN_GAP = 0.1;
+
+  const result = [];
+  for(const b of beats.filter(b=>kept.has(b)).sort((a,z)=>a.time-z.time)){
+    const group = laneGroups[b.band] || laneGroups[0];
+    // 그룹 내에서 가장 오래 전에 쓴 레인 선택
+    let bestLane = group.reduce((a,c)=>lastLaneTime[c]<lastLaneTime[a]?c:a, group[0]);
+    // 최소 간격 위반 시 전체 레인에서 여유 있는 곳 탐색
+    if(b.time - lastLaneTime[bestLane] < MIN_GAP){
+      const alt = [...Array(numLanes).keys()].find(i=>b.time-lastLaneTime[i]>=MIN_GAP);
+      if(alt !== undefined) bestLane = alt;
+      else return result; // 모든 레인 막혔으면 스킵
+    }
+    lastLaneTime[bestLane] = b.time;
+    result.push({...b, lane:bestLane});
+  }
+  return result;
+}
+
 function lH(){return laneEls[0]?laneEls[0].offsetHeight:window.innerHeight*0.8;}
 
 // ── 게임 루프 ──
@@ -770,7 +984,9 @@ function gameLoop(){
   });
   notes.forEach(n=>{
     if(!n.el||n.hit)return;
-    const b=H-(now-n.spawnTime)*sp;n.el.style.bottom=b+'px';
+    // hitTime 기준: hitTime에 정확히 hitLineBottom에 위치
+    const b = hitLineBottom + (n.hitTime - now) * sp;
+    n.el.style.bottom=b+'px';
     if(b<-30){n.hit=true;if(n.el.parentNode)n.el.remove();registerMiss(n.lane,true);}
   });
 
@@ -806,16 +1022,21 @@ addEventListener('keyup',e=>{held[e.key]=false;const idx=SCHEMES[laneCount].keys
 function pressLane(lane){
   if(!gameRunning)return;
   keyBtnEls[lane]&&keyBtnEls[lane].classList.add('pressed');
-  const cfg=DIFF[difficulty],sp=cfg.speed*speedMult,now=audioCtx.currentTime-startTime,H=lH();
-  const {hitLineBottom}=getLaneMetrics();
+  const cfg=DIFF[difficulty],sp=cfg.speed*speedMult,now=audioCtx.currentTime-startTime;
   let best=null,bestDist=Infinity;
-  notes.forEach(n=>{if(n.hit||n.lane!==lane||!n.el)return;const d=Math.abs(H-(now-n.spawnTime)*sp-hitLineBottom);if(d<bestDist){bestDist=d;best=n;}});
-  const pxPerf=sp*(cfg.perfect/1000),pxGreat=sp*(cfg.great/1000),pxGood=pxGreat*1.5;
-  if(best&&bestDist<=pxGood){
+  // hitTime 기준: |now - hitTime| 이 가장 작은 노트 선택 (시간 오차, ms 단위)
+  notes.forEach(n=>{
+    if(n.hit||n.lane!==lane||!n.el)return;
+    const d=Math.abs(now - n.hitTime);
+    if(d<bestDist){bestDist=d;best=n;}
+  });
+  // 판정 윈도우를 시간(초) 단위로 직접 비교
+  const tPerf=cfg.perfect/1000, tGreat=cfg.great/1000, tGood=tGreat*1.5;
+  if(best&&bestDist<=tGood){
     best.hit=true;
     if(best.el&&best.el.parentNode){hitFX(lane,best.el.getBoundingClientRect().bottom-laneEls[lane].getBoundingClientRect().top);best.el.remove();}
-    if(bestDist<=pxPerf)regPerfect(lane);else if(bestDist<=pxGreat)regGreat(lane);else regGood(lane);
-  }else if(!best||bestDist>pxGood*2){registerEmptyHit(lane);}
+    if(bestDist<=tPerf)regPerfect(lane);else if(bestDist<=tGreat)regGreat(lane);else regGood(lane);
+  }else if(!best||bestDist>tGood*2){registerEmptyHit(lane);}
 }
 function releaseLane(lane){keyBtnEls[lane]&&keyBtnEls[lane].classList.remove('pressed');}
 
