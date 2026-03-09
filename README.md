@@ -1,2 +1,2 @@
-# 빵냥 리듬게임
+# BigCat-Rhythm-Game
 Music Q
